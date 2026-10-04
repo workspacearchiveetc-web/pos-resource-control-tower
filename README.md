@@ -1,4 +1,36 @@
-# claude-codex-usage-dashboard
+# POS Resource Control Tower
+
+User-owned derivative of
+[`charlesDGY/claude-codex-usage-dashboard`](https://github.com/charlesDGY/claude-codex-usage-dashboard),
+retaining its MIT license and attribution. No source was copied from
+`Danielw412/AI-usage-tracker`; similar metrics here are independently derived
+from local Claude, Codex, and POS data.
+
+The dashboard is local-only (`127.0.0.1`) and read-only for provider data. It
+never launches, stops, or reconfigures Codex, Claude, or Autonomy8 workers.
+
+## POS quick start
+
+```bash
+./bin/pos-tower
+```
+
+Open <http://127.0.0.1:36668/>. Management commands are
+`pos-tower start|stop|restart|status|log`; they control only this dashboard.
+
+The top-level order is intentionally simple: OpenAI/Codex first, live
+POS/Autonomy8 status next, and Claude second/bottom. It includes:
+
+- 5h/7d quota, reset, and burn context;
+- API-equivalent cost estimates and locally indexed token totals;
+- session, project, model, and source attribution;
+- tokens per 1% quota when the active-window data makes that derivable;
+- Autonomy8 worker/build/reviewer counts, four lanes, cycles, commits, branch
+  heads, recent activity, and a bounded healthy-burn/runaway warning.
+
+---
+
+## Upstream documentation
 
 **Language**: [中文](README.zh-CN.md) · English
 
@@ -74,7 +106,7 @@ stdlib-only Python (with the exception of `npx` to fetch ccusage for Claude pric
 git clone https://github.com/charlesDGY/claude-codex-usage-dashboard.git ~/.cache/cc-dashboard
 cd ~/.cache/cc-dashboard
 
-# Start (default port 36668, binds 0.0.0.0 for LAN access)
+# Upstream launcher (the POS launcher above is preferred)
 ./bin/ccdash start
 ```
 
@@ -112,7 +144,7 @@ ccdash tail       # Live tail the log
 | Variable | Default | Purpose |
 |---|---|---|
 | `CC_DASHBOARD_PORT` | `36668` | Listen port |
-| `CC_DASHBOARD_HOST` | `0.0.0.0` | Bind address (use `127.0.0.1` for localhost-only) |
+| `CC_DASHBOARD_HOST` | `127.0.0.1` | Local-only bind address |
 | `CC_DASHBOARD_REFRESH` | `60` | Background refresh interval (seconds) |
 | `CC_DASHBOARD_CCUSAGE_TIMEOUT` | `60` | Per-call timeout for ccusage (seconds) |
 | `CC_DASHBOARD_LOCAL_DAYS` | `14` | Days of local jsonl to scan |
@@ -290,7 +322,7 @@ The dashboard is **read-only** and does not modify any external state. It reads:
 - `npx ccusage@latest ...` — Node.js subprocess, calls the LiteLLM pricing library (one-time download, then cached)
 - `codex exec` triggered via POST `/api/codex_probe` — calls codex CLI, sends an OpenAI API request (only on button click, throttled to 60s)
 
-**Binding**: defaults to `0.0.0.0:36668`, **reachable from any machine on your LAN**.
+**Binding in this derivative**: defaults to `127.0.0.1:36668` and is local-only.
 For public/untrusted networks, strongly recommend `CC_DASHBOARD_HOST=127.0.0.1` + SSH tunnel.
 
 The dashboard sends no telemetry and calls no external webhooks.

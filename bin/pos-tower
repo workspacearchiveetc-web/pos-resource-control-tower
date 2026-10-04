@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SOURCE="$0"
+while [ -h "$SOURCE" ]; do
+    LINK_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in /*) ;; *) SOURCE="$LINK_DIR/$SOURCE" ;; esac
+done
+HERE="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+ROOT="$(CDPATH= cd -- "$HERE/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+PORT="${POS_TOWER_PORT:-36668}"
+LOG="${POS_TOWER_LOG:-$ROOT/pos-tower.log}"
+PIDFILE="${POS_TOWER_PID:-$ROOT/pos-tower.pid}"
+
+export CC_DASHBOARD_HOST="127.0.0.1"
+export CC_DASHBOARD_PORT="$PORT"
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+start() {
+    if is_running; then
+        echo "POS Resource Control Tower already running: http://127.0.0.1:$PORT/"
+        return
+    fi
+    nohup "$PYTHON_BIN" -u "$ROOT/cc_dashboard.py" >"$LOG" 2>&1 </dev/null &
+    echo "$!" >"$PIDFILE"
+    sleep 2
+    if is_running; then
+        echo "POS Resource Control Tower: http://127.0.0.1:$PORT/"
+    else
+        echo "Start failed. Log: $LOG" >&2
+        tail -20 "$LOG" >&2
+        return 1
+    fi
+}
+
+stop() {
+    if ! is_running; then
+        echo "POS Resource Control Tower is not running."
+        return
+    fi
+    pid="$(cat "$PIDFILE")"
+    kill -TERM "$pid"
+    rm -f "$PIDFILE"
+    echo "Stopped dashboard PID $pid. Autonomy8 was not touched."
+}
+
+status() {
+    if is_running; then
+        echo "running PID $(cat "$PIDFILE") — http://127.0.0.1:$PORT/"
+        curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null && echo "health: ok"
+    else
+        echo "not running"
+    fi
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status) status ;;
+    log) tail -100 "$LOG" ;;
+    *) echo "usage: pos-tower {start|stop|restart|status|log}" >&2; exit 2 ;;
+esac

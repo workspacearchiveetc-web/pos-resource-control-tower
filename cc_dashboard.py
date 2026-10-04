@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code usage web dashboard (stdlib-only).
+"""POS Resource Control Tower (stdlib-only, local and read-only).
 
 Two data sources:
   1. ccusage --json  → daily / 5h-block / session totals + costs (LiteLLM pricing)
@@ -7,7 +7,7 @@ Two data sources:
                         / hourly trend / cache efficiency / top-expensive-turns
 
 Caches both in memory; background thread refreshes every REFRESH_SECONDS.
-Binds 0.0.0.0:<port> by default for LAN access.
+Binds 127.0.0.1:<port> for local-only access.
 """
 import json
 import os
@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = int(os.environ.get("CC_DASHBOARD_PORT", "36668"))
-HOST = os.environ.get("CC_DASHBOARD_HOST", "0.0.0.0")
+HOST = os.environ.get("CC_DASHBOARD_HOST", "127.0.0.1")
 REFRESH_SECONDS = int(os.environ.get("CC_DASHBOARD_REFRESH", "60"))
 CCUSAGE_TIMEOUT = int(os.environ.get("CC_DASHBOARD_CCUSAGE_TIMEOUT", "60"))
 LOCAL_SCAN_DAYS = int(os.environ.get("CC_DASHBOARD_LOCAL_DAYS", "14"))
@@ -40,10 +40,21 @@ CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CODEX_DB = Path.home() / ".codex" / "state_5.sqlite"
-CODEX_PRICING_FILE = Path.home() / ".cache" / "cc-dashboard" / "codex_pricing.json"
+CODEX_PRICING_FILE = Path(__file__).with_name("codex_pricing.json")
+AUTONOMY8_ROOT = Path.home() / "POS-builds" / "claude-autonomy8"
+AUTONOMY8_STATUS = AUTONOMY8_ROOT / "STATUS.json"
+AUTONOMY8_LOG = Path("/tmp/a8.log")
+AUTONOMY8_REPO = Path.home() / "POS-builds" / "autonomous-dispatch-v0"
+AUTONOMY8_BASES = {
+    "dispatcher": "recovery/r2-boundary-bypass-20261002",
+    "serial": "management/bounded-claude-serial-batch-v1-20261003",
+    "v4f": "recovery/r2-k2-k3-census-v4f-exact-byte-admission-20261003",
+    "r2pin": "recovery/r2-boundary-bypass-20261002",
+}
 
 _state = {
     "daily": None, "blocks": None, "session": None, "weekly": None, "anthropic": None, "codex": None,
+    "autonomy8": None,
     "local": None,
     "rtk": None,
     "last_refresh_ts": 0, "last_refresh_status": "init", "errors": [],
@@ -429,6 +440,9 @@ def scan_codex():
         "by_day": [],
         "by_model": [],
         "recent_sessions": [],
+        "by_source": [],
+        "lifetime_tokens": 0,
+        "lifetime_sessions": 0,
         "by_day_cost": [],   # day -> {usd, input_tokens, cached_input, output, reasoning}
         "by_model_cost": [], # model -> {usd, ...}
         "total_cost_14d": 0.0,
@@ -647,6 +661,11 @@ def scan_codex():
             con = sqlite3.connect(f"file:{CODEX_DB}?mode=ro", uri=True, timeout=2.0)
             con.row_factory = sqlite3.Row
             cur = con.cursor()
+
+            cur.execute("SELECT COUNT(*) AS n_threads, COALESCE(SUM(tokens_used), 0) AS total_tokens FROM threads")
+            lifetime = dict(cur.fetchone())
+            out["lifetime_sessions"] = lifetime["n_threads"]
+            out["lifetime_tokens"] = lifetime["total_tokens"]
             
             # Today / 7d totals
             cur.execute("""SELECT date(updated_at, 'unixepoch', 'localtime') AS day,
@@ -665,6 +684,13 @@ def scan_codex():
                            WHERE date(updated_at, 'unixepoch', 'localtime') >= date('now', '-13 days')
                            GROUP BY model ORDER BY total_tokens DESC""")
             out["by_model"] = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("""SELECT COALESCE(source, '?') AS source,
+                                  COUNT(*) AS n_threads,
+                                  SUM(tokens_used) AS total_tokens
+                           FROM threads
+                           GROUP BY source ORDER BY total_tokens DESC""")
+            out["by_source"] = [dict(r) for r in cur.fetchall()]
             
             # Recent 10 sessions
             cur.execute("""SELECT id, datetime(updated_at, 'unixepoch', 'localtime') AS updated,
@@ -678,6 +704,113 @@ def scan_codex():
             out["sqlite_error"] = str(e)
     
     return out, None
+
+
+def scan_autonomy8():
+    """Read controller state, process ancestry, git heads, and recent activity."""
+    data = {
+        "controller": None, "workers": [], "worker_count": 0,
+        "builders": 0, "reviewers": 0, "lanes": {}, "activity": [],
+        "health": "idle", "health_reason": "controller not running",
+    }
+    try:
+        if AUTONOMY8_STATUS.is_file():
+            snapshot = json.loads(AUTONOMY8_STATUS.read_text())
+            data["snapshot_utc"] = snapshot.get("utc")
+            data["snapshot_age_seconds"] = max(0, int(time.time() - AUTONOMY8_STATUS.stat().st_mtime))
+            data["lanes"] = snapshot.get("lanes") or {}
+    except Exception as e:
+        data["status_error"] = str(e)
+
+    try:
+        rows = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,etime=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()
+        processes = []
+        for row in rows:
+            m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)", row)
+            if m:
+                pid, ppid, elapsed, command = m.groups()
+                processes.append({"pid": int(pid), "ppid": int(ppid), "elapsed": elapsed, "command": command})
+        controller = next((p for p in processes if "/tmp/a8.py" in p["command"]), None)
+        if controller:
+            data["controller"] = {k: controller[k] for k in ("pid", "elapsed")}
+            descendants = {controller["pid"]}
+            changed = True
+            while changed:
+                changed = False
+                for p in processes:
+                    if p["ppid"] in descendants and p["pid"] not in descendants:
+                        descendants.add(p["pid"]); changed = True
+            for p in processes:
+                if p["pid"] not in descendants or p["pid"] == controller["pid"]:
+                    continue
+                cmd = p["command"]
+                if not re.search(r"(?:^|/)claude(?:\s|$)|/claude/versions/", cmd):
+                    continue
+                lane = re.search(r"LANE:\s*(dispatcher|serial|v4f|r2pin)", cmd)
+                reviewer = bool(re.search(r"Independent read-only (?:baseline|post-build) review", cmd, re.I))
+                data["workers"].append({
+                    "pid": p["pid"], "elapsed": p["elapsed"],
+                    "lane": lane.group(1) if lane else "unknown",
+                    "role": "reviewer" if reviewer else "builder",
+                })
+    except Exception as e:
+        data["process_error"] = str(e)
+
+    data["worker_count"] = len(data["workers"])
+    data["builders"] = sum(w["role"] == "builder" for w in data["workers"])
+    data["reviewers"] = sum(w["role"] == "reviewer" for w in data["workers"])
+
+    for name, lane in data["lanes"].items():
+        lane["short_head"] = (lane.get("head") or "")[:8]
+        base = AUTONOMY8_BASES.get(name)
+        if base and lane.get("head") and AUTONOMY8_REPO.is_dir():
+            try:
+                resolved_base = None
+                for candidate in (base, "origin/" + base):
+                    check = subprocess.run(
+                        ["git", "rev-parse", "--verify", candidate + "^{commit}"],
+                        cwd=AUTONOMY8_REPO, capture_output=True, text=True, timeout=5,
+                    )
+                    if check.returncode == 0:
+                        resolved_base = check.stdout.strip()
+                        break
+                if not resolved_base:
+                    continue
+                proc = subprocess.run(
+                    ["git", "rev-list", "--count", f"{resolved_base}..{lane['head']}"],
+                    cwd=AUTONOMY8_REPO, capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode == 0:
+                    lane["commits_ahead"] = int(proc.stdout.strip())
+            except Exception:
+                pass
+
+    try:
+        if AUTONOMY8_LOG.is_file():
+            lines = [line.strip() for line in AUTONOMY8_LOG.read_text(errors="replace").splitlines() if line.strip()]
+            data["activity"] = [line for line in lines if re.search(
+                r"BUILDER_LAUNCHED|REVIEWER_LAUNCHED|LANE_|HOLD_|PUSH |ACCEPTED|HUMAN_REQUIRED|AUTONOMY8_TERMINAL",
+                line,
+            )][-10:]
+            data["log_age_seconds"] = max(0, int(time.time() - AUTONOMY8_LOG.stat().st_mtime))
+    except Exception as e:
+        data["log_error"] = str(e)
+
+    terminal = {"ACCEPTED", "HUMAN_REQUIRED", "HOLD_MAX_CYCLES"}
+    statuses = [lane.get("status") for lane in data["lanes"].values()]
+    stale = data.get("snapshot_age_seconds", 0) > 300
+    if data["worker_count"] > 8:
+        data["health"], data["health_reason"] = "suspected-runaway", "more than 8 Claude workers"
+    elif data["controller"] and data["worker_count"] and stale:
+        data["health"], data["health_reason"] = "suspected-runaway", "workers active but STATUS.json is over 5 minutes stale"
+    elif data["controller"] and data["worker_count"] <= 8:
+        data["health"], data["health_reason"] = "healthy-burn", "controller live, within 8-worker cap, status updating"
+    elif statuses and all(s in terminal for s in statuses):
+        data["health"], data["health_reason"] = "terminal", "all lanes reached terminal status"
+    return data, None
 
 
 def refresh_loop():
@@ -700,12 +833,8 @@ def refresh_loop():
             if err: errs.append(f"anthropic: {err}")
             codex, err = scan_codex()
             if err: errs.append(f"codex: {err}")
-            # Auto-probe if enabled + data stale + min-interval respected
-            if CODEX_AUTO_PROBE_AGE_SECONDS > 0 and codex:
-                age = codex.get("rate_limits_age_seconds")
-                if age is None or age > CODEX_AUTO_PROBE_AGE_SECONDS:
-                    threading.Thread(target=probe_codex, args=("auto-stale",), daemon=True).start()
-
+            autonomy8, err = scan_autonomy8()
+            if err: errs.append(f"autonomy8: {err}")
             with _state_lock:
                 if daily is not None: _state["daily"] = daily
                 if blocks is not None: _state["blocks"] = blocks
@@ -715,6 +844,7 @@ def refresh_loop():
                 if rtk is not None: _state["rtk"] = rtk
                 if anthro is not None: _state["anthropic"] = anthro
                 if codex is not None: _state["codex"] = codex
+                if autonomy8 is not None: _state["autonomy8"] = autonomy8
                 _state["last_refresh_ts"] = int(time.time())
                 _state["last_refresh_status"] = "ok" if not errs else "partial"
                 _state["errors"] = errs
@@ -733,7 +863,7 @@ def refresh_loop():
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Claude Code Usage</title>
+<html lang="en"><head><meta charset="UTF-8"><title>POS Resource Control Tower</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
@@ -769,7 +899,7 @@ tr:hover { background: #1c2128; }
 .hour-label { font-size: 9px; color: #6e7681; margin-top: 4px; display: flex; gap: 2px; }
 .hour-label > span { width: 14px; text-align: center; }
 </style></head><body>
-<h1>Claude Code 使用监控</h1>
+<h1>POS • AI Resource Control Tower</h1>
 <div class="subtle" id="hostinfo">…</div>
 
 <div class="toolbar">
@@ -779,26 +909,28 @@ tr:hover { background: #1c2128; }
 </div>
 
 
-<!-- Anthropic + Codex real-time quotas (side-by-side, authoritative) -->
-<div class="grid">
-  <!-- Anthropic real-time quota (authoritative) -->
-<div class="card" style="background: #11251a; border-color: #3fb95044;">
-  <h2 style="color: #3fb950;">⚡ Anthropic 官方实时配额 (authoritative)</h2>
-  <div id="anthropic_card">…</div>
-  <div class="subtle" style="margin-top:8px;">数据来源: <code>https://api.anthropic.com/api/oauth/usage</code> · 同 <code>/usage</code> slash command</div>
-</div>
-  <!-- Codex (OpenAI) real-time quota -->
+<!-- OpenAI / Codex first -->
 <div class="card" style="background: #1f1322; border-color: #a371f744;">
-  <h2 style="color: #a371f7;">⚡ Codex (OpenAI) 实时配额 (authoritative)
-    <button id="codex_probe_btn" onclick="probeCodex()" 
-      style="margin-left:10px;padding:3px 10px;background:#a371f722;border:1px solid #a371f744;color:#a371f7;border-radius:4px;font-size:11px;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:500;">
-      🔄 立即刷新
-    </button>
-    <span id="codex_probe_status" class="subtle" style="margin-left:8px;font-size:11px;text-transform:none;font-weight:400;"></span>
-  </h2>
+  <h2 style="color: #a371f7;">OpenAI • Codex / Work</h2>
   <div id="codex_card">…</div>
-  <div class="subtle" style="margin-top:8px;">数据来源: <code>~/.codex/sessions/.../rollout-*.jsonl</code> 最近一次 codex API 调用回传的 rate_limits</div>
+  <div class="subtle" style="margin-top:8px;">Read-only local data: <code>~/.codex/state_5.sqlite</code> and session JSONL.</div>
 </div>
+
+<!-- POS / Autonomy8 operational status -->
+<div class="card" style="background:#102131;border-color:#39c5cf55;">
+  <h2 style="color:#39c5cf;">POS • Autonomy8</h2>
+  <div id="a8_summary">…</div>
+  <table id="a8_lanes"><thead><tr>
+    <th>lane</th><th>status</th><th class="right">cycle</th><th class="right">commits</th><th>branch / head</th>
+  </tr></thead><tbody></tbody></table>
+  <div id="a8_activity" class="subtle" style="margin-top:10px;line-height:1.5;">…</div>
+</div>
+
+<!-- Claude second / bottom provider card -->
+<div class="card" style="background: #11251a; border-color: #3fb95044;">
+  <h2 style="color: #3fb950;">Claude</h2>
+  <div id="anthropic_card">…</div>
+  <div class="subtle" style="margin-top:8px;">Quota is fetched read-only; detailed usage comes from local Claude session data.</div>
 </div>
 
 <!-- Top: current 5h block -->
@@ -960,6 +1092,7 @@ const fmt = (n) => {
 };
 const fmtUSD = (n) => n != null ? '$' + Number(n).toFixed(2) : '-';
 const fmtPct = (n) => n != null ? Number(n).toFixed(1) + '%' : '-';
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // Defensive percent formatter (0dp). Returns '?' when value is missing/non-finite.
 // Upstream may send null (e.g. Codex rate_limits.primary on the premium plan,
 // or anthropic.seven_day when the API hasn't populated it yet).
@@ -1059,35 +1192,6 @@ function renderInsights(d) {
   if (el) el.innerHTML = lines.length ? lines.map(l => '• ' + l).join('<br>') : '<span class="subtle">无数据</span>';
 }
 
-
-async function probeCodex() {
-  const btn = document.getElementById('codex_probe_btn');
-  const stat = document.getElementById('codex_probe_status');
-  if (!btn || btn.disabled) return;
-  btn.disabled = true; btn.style.opacity = '0.5';
-  stat.textContent = '触发中…(约 30-60s)';
-  try {
-    const r = await fetch('/api/codex_probe', { method: 'POST' });
-    const d = await r.json();
-    if (d.state && d.state.last_probe_status && d.state.last_probe_status.startsWith('throttled')) {
-      stat.textContent = '⏱ ' + d.state.last_probe_status;
-      btn.disabled = false; btn.style.opacity = '1';
-      setTimeout(() => stat.textContent = '', 5000);
-      return;
-    }
-    const waitMs = Math.max(30000, ((d.refresh_seconds || 60) + 5) * 1000);
-    stat.textContent = `✓ 已触发，等 probe 完成或下次 dashboard refresh (~${Math.round(waitMs / 1000)}s)`;
-    // Re-enable + auto-refresh after the next backend scan window so user sees new data.
-    setTimeout(() => {
-      btn.disabled = false; btn.style.opacity = '1';
-      stat.textContent = '';
-      refresh();
-    }, waitMs);
-  } catch (e) {
-    stat.textContent = '✗ ' + e.message;
-    btn.disabled = false; btn.style.opacity = '1';
-  }
-}
 
 async function refresh() {
   try {
@@ -1191,7 +1295,18 @@ async function refresh() {
         html += `<div style="margin-top:12px;border-top:1px solid #21262d;padding-top:8px;font-size:12px;color:#8b949e;">${subRows.join(' · ')}</div>`;
       }
 
-      html += `<div class="subtle" style="margin-top:8px;">订阅: <b>${meta.subscription || '?'}</b> · 速率层级: <b>${meta.tier || '?'}</b></div>`;
+      const claudeDaily = (d.daily?.daily) || [];
+      const claudeApiCost = claudeDaily.reduce((sum, row) => sum + (row.totalCost || 0), 0);
+      const ca = local.cache_all || {};
+      const claudeIndexed = (ca.in || 0) + (ca.out || 0) + (ca.cc || 0) + (ca.cr || 0);
+      const activeBlock = (d.blocks?.blocks || [])[0] || {};
+      const tokensPerPct = fhU > 0 && activeBlock.totalTokens ? activeBlock.totalTokens / fhU : null;
+      html += `<div style="margin-top:12px;border-top:1px solid #21262d;padding-top:8px;">
+        <span class="metric"><span class="label">API-equivalent cost</span> <b>${fmtUSD(claudeApiCost)}</b></span>
+        <span class="metric"><span class="label">Indexed tokens (${local.scan_days || '?'}d)</span> <b>${fmt(claudeIndexed)}</b></span>
+        <span class="metric"><span class="label">5h tokens / 1% quota</span> <b>${tokensPerPct == null ? 'not derivable' : fmt(tokensPerPct)}</b></span>
+      </div>`;
+      html += `<div class="subtle" style="margin-top:8px;">Subscription: <b>${meta.subscription || '?'}</b> · tier: <b>${meta.tier || '?'}</b></div>`;
       ac.innerHTML = html;
     } else {
       ac.innerHTML = '<span class="subtle">Anthropic 数据未读到 (token 失效?). 重新跑 claude 登录刷新</span>';
@@ -1253,31 +1368,40 @@ async function refresh() {
       // Append cost section
       if (codex.total_cost_14d != null) {
         html += `<div style="margin-top:12px;border-top:1px solid #21262d;padding-top:8px;font-size:12px;color:#8b949e;">
-          <span class="metric"><span class="label">今日估算成本</span> <b style="color:#a371f7">${fmtUSD(codex.today_cost)}</b></span>
-          <span class="metric"><span class="label">近 14 天成本</span> <b style="color:#a371f7">${fmtUSD(codex.total_cost_14d)}</b></span>
-          <span class="subtle"> · 估算用 ~/.cache/cc-dashboard/codex_pricing.json</span>
+          <span class="metric"><span class="label">API-equivalent today</span> <b style="color:#a371f7">${fmtUSD(codex.today_cost)}</b></span>
+          <span class="metric"><span class="label">API-equivalent 14d</span> <b style="color:#a371f7">${fmtUSD(codex.total_cost_14d)}</b></span>
+          <span class="metric"><span class="label">Indexed lifetime tokens</span> <b>${fmt(codex.lifetime_tokens || 0)}</b></span>
+          <span class="metric"><span class="label">Indexed sessions</span> <b>${fmt(codex.lifetime_sessions || 0)}</b></span>
+          <span class="subtle"> · local price table</span>
         </div>`;
       }
       cd.innerHTML = html;
-      // Reflect probe in-progress state in the button
-      const ps = d.codex_probe || {};
-      const btn = document.getElementById('codex_probe_btn');
-      const pstat = document.getElementById('codex_probe_status');
-      if (btn && pstat) {
-        if (ps.in_progress) {
-          btn.disabled = true; btn.style.opacity = '0.5';
-          pstat.textContent = '触发中…';
-        } else if (ps.last_probe_ts) {
-          const since = Math.floor((Date.now()/1000) - ps.last_probe_ts);
-          if (since < 60) {
-            const stOk = (ps.last_probe_status || '').startsWith('ok');
-            pstat.innerHTML = (stOk ? '✓ ' : '✗ ') + (ps.last_probe_reason || '?') + ` · ${since}s 前`;
-          }
-        }
-      }
     } else {
       cd.innerHTML = '<span class="subtle">没找到 codex session 文件 (跑过任一 codex 任务后即可)</span>';
     }
+
+    // POS / Autonomy8
+    const a8 = d.autonomy8 || {};
+    const a8s = document.getElementById('a8_summary');
+    const healthColor = a8.health === 'healthy-burn' ? '#3fb950' : (a8.health === 'suspected-runaway' ? '#f85149' : '#d29922');
+    const controller = a8.controller || {};
+    a8s.innerHTML = `
+      <div class="metric"><div class="label">health</div><div class="value" style="color:${healthColor}">${esc(a8.health || 'unknown')}</div><div class="subtle">${esc(a8.health_reason || '')}</div></div>
+      <div class="metric"><div class="label">Claude workers</div><div class="value">${fmt(a8.worker_count || 0)}/8</div></div>
+      <div class="metric"><div class="label">builders / reviewers</div><div class="value">${fmt(a8.builders || 0)} / ${fmt(a8.reviewers || 0)}</div></div>
+      <div class="metric"><div class="label">controller</div><div class="value">${controller.pid ? 'PID ' + controller.pid : 'offline'}</div><div class="subtle">${esc(controller.elapsed || '')}</div></div>`;
+    const a8b = document.querySelector('#a8_lanes tbody');
+    a8b.innerHTML = '';
+    for (const name of ['dispatcher', 'serial', 'v4f', 'r2pin']) {
+      const lane = (a8.lanes || {})[name] || {};
+      const st = lane.status || 'UNKNOWN';
+      const stColor = st === 'ACCEPTED' ? '#3fb950' : (st.includes('HUMAN_REQUIRED') ? '#f85149' : (st.startsWith('HOLD') ? '#d29922' : '#39c5cf'));
+      a8b.innerHTML += `<tr><td><b>${name}</b></td><td style="color:${stColor}">${esc(st)}</td>
+        <td class="right">${esc(lane.cycle ?? '-')}</td><td class="right">${esc(lane.commits_ahead ?? '-')}</td>
+        <td><span class="subtle">${esc(lane.branch || '-')} @ ${esc(lane.short_head || '-')}</span></td></tr>`;
+    }
+    const a8a = document.getElementById('a8_activity');
+    a8a.innerHTML = '<b>Recent activity</b><br>' + ((a8.activity || []).map(esc).join('<br>') || 'No recent controller activity.');
 
     // Codex by-day — merge state_5.sqlite token sums with jsonl-derived cost
     const cdb = document.querySelector('#codex_day_table tbody');
@@ -1336,8 +1460,8 @@ async function refresh() {
       const cur = weeks[weeks.length - 1];
       const prev4 = weeks.slice(-5, -1);  // up to 4 prior weeks
       // determine days elapsed in current week (ISO Sun-start ccusage style)
-      // cur.week is the start date string YYYY-MM-DD
-      const startDate = new Date(cur.week + 'T00:00:00');
+      // ccusage calls the start-date field "period".
+      const startDate = new Date((cur.period || cur.week) + 'T00:00:00');
       const now = new Date();
       const elapsedDays = Math.max(1, Math.min(7, Math.floor((now - startDate) / 86400000) + 1));
       const fractionElapsed = elapsedDays / 7;
@@ -1498,7 +1622,7 @@ async function refresh() {
     for (const row of daily.slice(-14).reverse()) {
       const models = (row.modelsUsed || []).map(m => m.replace('claude-','').replace(/-2025\d+/,'')).join(' + ');
       db.innerHTML += `<tr>
-        <td>${row.date}</td>
+        <td>${row.period || row.date || '-'}</td>
         <td><span class="subtle">${models}</span></td>
         <td class="right">${fmt(row.inputTokens)}</td>
         <td class="right">${fmt(row.outputTokens)}</td>
@@ -1645,7 +1769,7 @@ class Handler(BaseHTTPRequestHandler):
             with _state_lock:
                 payload = {
                     "daily": _state["daily"], "blocks": _state["blocks"],
-                    "session": _state["session"], "weekly": _state["weekly"], "local": _state["local"], "rtk": _state["rtk"], "anthropic": _state["anthropic"], "codex": _state["codex"],
+                    "session": _state["session"], "weekly": _state["weekly"], "local": _state["local"], "rtk": _state["rtk"], "anthropic": _state["anthropic"], "codex": _state["codex"], "autonomy8": _state["autonomy8"],
                     "last_refresh_ts": _state["last_refresh_ts"],
                     "last_refresh_status": _state["last_refresh_status"],
                     "errors": _state["errors"],
@@ -1663,19 +1787,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/codex_probe":
-            # Trigger probe in background; return immediately with status
-            threading.Thread(target=probe_codex, args=("manual-button",), daemon=True).start()
-            with _codex_probe_lock:
-                state = dict(_codex_probe_state)
-            body = json.dumps({"triggered": True, "state": state, "refresh_seconds": REFRESH_SECONDS}).encode()
-            self.send_response(202)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
-        else:
-            self.send_response(404); self.end_headers()
+        self.send_response(405)
+        self.send_header("Allow", "GET")
+        self.end_headers()
 
 
 def main():
