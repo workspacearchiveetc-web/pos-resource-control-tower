@@ -1,6 +1,8 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,24 @@ class DashboardContractTests(unittest.TestCase):
             "builders / reviewers", "commits", "Recent activity",
         ):
             self.assertIn(text, html)
+
+    def test_codexbar_fallback_translates_left_to_used(self):
+        output = """Session: 78% left
+Resets in 1h 43m
+Weekly: 67% left
+Resets in 1d 8h
+Plan: Pro
+"""
+        with patch.object(DASHBOARD.shutil, "which", return_value="/tmp/codexbar"), patch.object(
+            DASHBOARD.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout=output),
+        ):
+            data, error = DASHBOARD.fetch_claude_quota_fallback()
+        self.assertIsNone(error)
+        self.assertEqual(data["five_hour"]["utilization"], 22.0)
+        self.assertEqual(data["seven_day"]["utilization"], 33.0)
+        self.assertEqual(data["_meta"]["subscription"], "pro")
 
 
 if __name__ == "__main__":

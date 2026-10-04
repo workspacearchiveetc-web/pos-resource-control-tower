@@ -380,6 +380,43 @@ def fetch_anthropic_usage():
         return None, f"{type(e).__name__}: {e}"
 
 
+def fetch_claude_quota_fallback():
+    """Translate local CodexBar text into the Anthropic quota card schema."""
+    binary = shutil.which("codexbar")
+    if not binary:
+        return None, "codexbar missing"
+    try:
+        proc = subprocess.run(
+            [binary, "--provider", "claude", "--format", "text", "--no-color"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode:
+            return None, f"codexbar rc={proc.returncode}"
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        data = {"_meta": {"source": "codexbar fallback", "fetched_at": int(time.time())}}
+        current = None
+        for line in lines:
+            m = re.match(r"^(Session|Weekly):\s*(\d+(?:\.\d+)?)%\s+left", line, re.I)
+            if m:
+                current = "five_hour" if m.group(1).lower() == "session" else "seven_day"
+                data[current] = {"utilization": 100.0 - float(m.group(2))}
+                continue
+            if current and line.lower().startswith("resets in "):
+                delta = timedelta()
+                d = re.search(r"(\d+)d", line); h = re.search(r"(\d+)h", line); mins = re.search(r"(\d+)m", line)
+                delta = timedelta(days=int(d.group(1)) if d else 0,
+                                  hours=int(h.group(1)) if h else 0,
+                                  minutes=int(mins.group(1)) if mins else 0)
+                data[current]["resets_at"] = (datetime.now().astimezone() + delta).isoformat()
+            elif line.startswith("Plan:"):
+                data["_meta"]["subscription"] = line.split(":", 1)[1].strip().lower()
+        if "five_hour" not in data:
+            return None, "codexbar quota parse failed"
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
 
 
 def probe_codex(reason="manual"):
@@ -830,7 +867,11 @@ def refresh_loop():
             rtk, err = scan_rtk()
             if err: errs.append(f"rtk: {err}")
             anthro, err = fetch_anthropic_usage()
-            if err: errs.append(f"anthropic: {err}")
+            if err:
+                direct_error = err
+                anthro, fallback_error = fetch_claude_quota_fallback()
+                if fallback_error:
+                    errs.append(f"anthropic: {direct_error}; fallback: {fallback_error}")
             codex, err = scan_codex()
             if err: errs.append(f"codex: {err}")
             autonomy8, err = scan_autonomy8()
